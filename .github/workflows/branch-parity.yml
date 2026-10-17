@@ -1,0 +1,202 @@
+name: Branch Parity
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: branch-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MAIN_BRANCH: main
+  DEVELOP_BRANCH: develop
+  TELEMETRY_MAX_BYTES: '4096'
+
+jobs:
+  parity:
+    name: Verify main/develop parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch main and develop refs
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for branch in "$MAIN_BRANCH" "$DEVELOP_BRANCH"; do
+            if git fetch --no-tags --prune origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"; then
+              echo "Fetched origin/${branch}"
+            else
+              echo "::error::Unable to fetch origin/${branch}. The branch may be missing or renamed; update MAIN_BRANCH/DEVELOP_BRANCH in .github/workflows/branch-parity.yml."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          for branch in "$MAIN_BRANCH" "$DEVELOP_BRANCH"; do
+            if ! git rev-parse --verify --quiet "refs/remotes/origin/${branch}" >/dev/null; then
+              echo "::error::origin/${branch} does not resolve to a commit after fetch. The branch may be missing or renamed."
+              exit 1
+            fi
+          done
+
+      - name: Run parity check (first pass)
+        id: parity_first
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p parity-reports
+          node scripts/branch-parity.js \
+            --main "origin/${MAIN_BRANCH}" \
+            --develop "origin/${DEVELOP_BRANCH}" \
+            --output parity-reports/report-1.json
+
+      - name: Run parity check (second pass)
+        id: parity_second
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/branch-parity.js \
+            --main "origin/${MAIN_BRANCH}" \
+            --develop "origin/${DEVELOP_BRANCH}" \
+            --output parity-reports/report-2.json
+
+      - name: Verify reproducibility
+        id: reproducibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          hash_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+          h1="$(hash_file parity-reports/report-1.json)"
+          h2="$(hash_file parity-reports/report-2.json)"
+          echo "report-1 sha256: ${h1}"
+          echo "report-2 sha256: ${h2}"
+          echo "hash1=${h1}" >> "$GITHUB_OUTPUT"
+          echo "hash2=${h2}" >> "$GITHUB_OUTPUT"
+          if [ "$h1" != "$h2" ]; then
+            echo "::error::Reproducibility check failed: repeated parity runs produced different report hashes (${h1} vs ${h2}). Inspect parity-reports artifacts for nondeterministic output."
+            exit 1
+          fi
+          echo "Reproducibility check passed."
+
+      - name: Write telemetry
+        if: always()
+        id: telemetry
+        shell: bash
+        env:
+          PARITY_STATUS: ${{ job.status }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+          HASH1: ${{ steps.reproducibility.outputs.hash1 }}
+          HASH2: ${{ steps.reproducibility.outputs.hash2 }}
+        run: |
+          set -euo pipefail
+          mkdir -p parity-reports
+          report="parity-reports/report-1.json"
+          status="${PARITY_STATUS:-unknown}"
+          ahead=0
+          behind=0
+          divergent=0
+          duration=0
+          if [ -f "$report" ]; then
+            ahead="$(node -e 'const fs=require("fs");try{const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(String(Number(r.ahead)||0))}catch(e){process.stdout.write("0")}' "$report")"
+            behind="$(node -e 'const fs=require("fs");try{const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(String(Number(r.behind)||0))}catch(e){process.stdout.write("0")}' "$report")"
+            divergent="$(node -e 'const fs=require("fs");try{const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const d=Array.isArray(r.divergentCommits)?r.divergentCommits.length:Number(r.divergent)||0;process.stdout.write(String(d))}catch(e){process.stdout.write("0")}' "$report")"
+            duration="$(node -e 'const fs=require("fs");try{const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(String(Number(r.durationMs)||0))}catch(e){process.stdout.write("0")}' "$report")"
+          fi
+          telemetry="$(node -e '
+            const [status, ahead, behind, divergent, duration, runId, attempt, repo, h1, h2] = process.argv.slice(1);
+            const record = {
+              check: "branch-parity",
+              status: status,
+              ahead: Number(ahead) || 0,
+              behind: Number(behind) || 0,
+              divergentCommits: Number(divergent) || 0,
+              durationMs: Number(duration) || 0,
+              runId: runId,
+              runAttempt: attempt,
+              repository: repo,
+              reproducible: h1 && h2 ? h1 === h2 : null,
+            };
+            process.stdout.write(JSON.stringify(record));
+          ' "$status" "$ahead" "$behind" "$divergent" "$duration" "$RUN_ID" "$RUN_ATTEMPT" "$REPO" "$HASH1" "$HASH2")"
+          max="${TELEMETRY_MAX_BYTES:-4096}"
+          if [ "${#telemetry}" -gt "$max" ]; then
+            telemetry="${telemetry:0:$max}"
+          fi
+          printf '%s\n' "$telemetry" > parity-reports/telemetry.json
+          {
+            echo "### Branch parity telemetry"
+            echo '```json'
+            printf '%s\n' "$telemetry"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report drift
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="parity-reports/report-1.json"
+          if [ -f "$report" ]; then
+            node -e '
+              const fs = require("fs");
+              let r;
+              try { r = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { process.exit(0); }
+              const commits = Array.isArray(r.divergentCommits) ? r.divergentCommits : [];
+              const files = Array.isArray(r.divergentFiles) ? r.divergentFiles : [];
+              if (commits.length) {
+                console.log("Divergent commits:");
+                for (const c of commits.slice(0, 50)) console.log("  - " + String(c));
+              }
+              if (files.length) {
+                console.log("Divergent files:");
+                for (const f of files.slice(0, 50)) console.log("  - " + String(f));
+              }
+            ' "$report"
+          fi
+          echo "::error::Branch parity check failed. main and develop have drifted or the check could not run. Review the divergent commits/files above, reconcile the branches, and re-run."
+
+      - name: Upload parity artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: branch-parity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: parity-reports/
+          if-no-files-found: warn
+          retention-days: 14
